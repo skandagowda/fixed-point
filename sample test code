@@ -1,0 +1,284 @@
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+
+entity fixed_multiply_pipelined is
+    generic (
+        WIDTH     : integer := 16;
+        FRAC_BITS : integer := 8
+    );
+    port (
+        clk : in  std_logic;
+        rst : in  std_logic;
+        a   : in  signed(WIDTH-1 downto 0);
+        b   : in  signed(WIDTH-1 downto 0);
+        p   : out signed(WIDTH-1 downto 0)
+    );
+end fixed_multiply_pipelined;
+
+architecture rtl of fixed_multiply_pipelined is
+    -- Pipeline stages
+    signal stage1_product : signed(2*WIDTH-1 downto 0);
+    signal stage2_rounded : signed(2*WIDTH-1 downto 0);
+    signal stage3_result  : signed(WIDTH-1 downto 0);
+begin
+    process(clk, rst)
+    begin
+        if rst = '1' then
+            stage1_product <= (others => '0');
+            stage2_rounded <= (others => '0');
+            stage3_result  <= (others => '0');
+        elsif rising_edge(clk) then
+            -- Stage 1: Multiply
+            stage1_product <= a * b;
+            
+            -- Stage 2: Round
+            stage2_rounded <= stage1_product + (2**(FRAC_BITS-1));
+            
+            -- Stage 3: Scale
+            stage3_result <= stage2_rounded(WIDTH+FRAC_BITS-1 downto FRAC_BITS);
+        end if;
+    end process;
+    
+    p <= stage3_result;
+end rtl;
+
+-----------------------------------------------------------------------------------------------------------------------------------------------
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+use IEEE.float_pkg.all;
+
+entity float_multiply is
+    port (
+        clk : in  std_logic;
+        a   : in  float32;              -- 32-bit float
+        b   : in  float32;              -- 32-bit float
+        p   : out float32               -- Product
+    );
+end float_multiply;
+
+architecture rtl of float_multiply is
+begin
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            p <= a * b;  -- Direct multiplication
+        end if;
+    end process;
+end rtl;
+--------------------------------------------------------------------------------------------------------------------------------------------------
+
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+
+entity fixed_point_multiplier  is
+    port (
+        clk     : in  std_logic;
+        rst     : in  std_logic;
+        fp_bits : in  std_logic_vector(31 downto 0);  -- IEEE 754 single precision
+        valid_in: in  std_logic;
+        int_out : out signed(15 downto 0);
+        valid_out: out std_logic
+    );
+end fixed_point_multiplier ;
+
+architecture rtl of fixed_point_multiplier  is
+    -- Extract IEEE 754 fields
+    signal sign     : std_logic;
+    signal exponent : unsigned(7 downto 0);
+    signal mantissa : unsigned(22 downto 0);
+    
+    -- Pipeline registers
+    signal exp_val  : integer range -127 to 128;
+    signal mantissa_shifted : signed(47 downto 0);  -- Wide enough for all shifts
+    signal result_temp : signed(31 downto 0);
+    signal result_final : signed(15 downto 0);
+    
+    -- Pipeline control
+    signal valid_stage1, valid_stage2, valid_stage3 : std_logic;
+    
+begin
+    -- Extract fields (combinational)
+    sign     <= fp_bits(31);
+    exponent <= unsigned(fp_bits(30 downto 23));
+    mantissa <= unsigned(fp_bits(22 downto 0));
+    
+    -- Stage 1: Calculate exponent and prepare mantissa
+    process(clk, rst)
+    begin
+        if rst = '1' then
+            exp_val <= 0;
+            mantissa_shifted <= (others => '0');
+            valid_stage1 <= '0';
+        elsif rising_edge(clk) then
+            valid_stage1 <= valid_in;
+            
+            if valid_in = '1' then
+                exp_val <= to_integer(exponent) - 127;  -- Remove bias
+                
+                -- Create mantissa with implicit leading 1
+                -- Format: 1.mantissa in position [46:24]
+                mantissa_shifted <= (others => '0');
+                mantissa_shifted(46) <= '1';  -- Implicit leading 1
+                mantissa_shifted(45 downto 23) <= signed(mantissa);
+            end if;
+        end if;
+    end process;
+    
+    -- Stage 2: Barrel shifter for alignment
+    process(clk, rst)
+        variable shift_amt : integer;
+        variable temp : signed(47 downto 0);
+    begin
+        if rst = '1' then
+            result_temp <= (others => '0');
+            valid_stage2 <= '0';
+        elsif rising_edge(clk) then
+            valid_stage2 <= valid_stage1;
+            
+            if valid_stage1 = '1' then
+                temp := mantissa_shifted;
+                shift_amt := exp_val - 23;  -- Align binary point
+                
+                -- Implement barrel shifter using if-elsif chain
+                -- This is synthesizable as it creates multiplexers
+                if shift_amt > 23 then
+                    -- Large positive shift - likely overflow
+                    temp := shift_left(temp, 23);
+                elsif shift_amt >= 16 then
+                    temp := shift_left(temp, 16);
+                    temp := shift_left(temp, shift_amt - 16);
+                elsif shift_amt >= 8 then
+                    temp := shift_left(temp, 8);
+                    temp := shift_left(temp, shift_amt - 8);
+                elsif shift_amt >= 0 then
+                    temp := shift_left(temp, shift_amt);
+                elsif shift_amt >= -8 then
+                    temp := shift_right(temp, -shift_amt);
+                elsif shift_amt >= -16 then
+                    temp := shift_right(temp, 8);
+                    temp := shift_right(temp, -(shift_amt + 8));
+                elsif shift_amt >= -23 then
+                    temp := shift_right(temp, 16);
+                    temp := shift_right(temp, -(shift_amt + 16));
+                else
+                    -- Large negative shift - result is zero
+                    temp := (others => '0');
+                end if;
+                
+                -- Extract integer part (bits 46 downto 15 contain integer)
+                result_temp <= temp(46 downto 15);
+            end if;
+        end if;
+    end process;
+    
+    -- Stage 3: Apply sign and saturate
+    process(clk, rst)
+        variable temp : signed(31 downto 0);
+        variable sign_reg : std_logic;
+    begin
+        if rst = '1' then
+            result_final <= (others => '0');
+            valid_stage3 <= '0';
+            sign_reg := '0';
+        elsif rising_edge(clk) then
+            valid_stage3 <= valid_stage2;
+            sign_reg := sign;  -- Register sign from earlier stage
+            
+            if valid_stage2 = '1' then
+                temp := result_temp;
+                
+                -- Apply sign
+                if sign_reg = '1' then
+                    temp := -temp;
+                end if;
+                
+                -- Saturate to 16-bit range [-32768, 32767]
+                if temp > 32767 then
+                    result_final <= to_signed(32767, 16);
+                elsif temp < -32768 then
+                    result_final <= to_signed(-32768, 16);
+                else
+                    result_final <= temp(15 downto 0);
+                end if;
+            end if;
+        end if;
+    end process;
+    
+    int_out <= result_final;
+    valid_out <= valid_stage3;
+    
+end rtl;
+------------------------------------------------------------------------------------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity fixed_mult is
+    port (
+        clk     : in  std_logic;
+        a, b    : in  signed(15 downto 0);   -- Q1.15 format
+        prod    : out signed(15 downto 0)    -- Q1.15 result
+    );
+end entity;
+
+architecture rtl of fixed_mult is
+    signal mult_full : signed(31 downto 0);
+begin
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            mult_full <= a * b;                   -- full 32-bit product
+            prod      <= mult_full(30 downto 15); -- keep middle 16 bits
+        end if;
+    end process;
+end architecture;
+-----------------------------------------------------------------------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity fixed_to_int is
+    port (
+        clk       : in  std_logic;
+        fixed_in  : in  signed(15 downto 0);  -- Q1.15
+        int_out   : out signed(15 downto 0)   -- signed integer
+    );
+end entity;
+
+architecture rtl of fixed_to_int is
+begin
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            -- shift right by 15 to remove fractional part
+            int_out <= resize(shift_right(fixed_in, 15), 16);
+        end if;
+    end process;
+end architecture;
+-----------------------------------------------------------------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity int_to_fixed is
+    port (
+        clk       : in  std_logic;
+        int_in    : in  signed(15 downto 0);  -- signed integer
+        fixed_out : out signed(15 downto 0)   -- Q1.15
+    );
+end entity;
+
+architecture rtl of int_to_fixed is
+begin
+    process(clk)
+    begin
+        if rising_edge(clk) then
+            -- shift left by 15 to convert integer to Q1.15
+            fixed_out <= resize(shift_left(int_in, 15), 16);
+        end if;
+    end process;
+end architecture;
+-------------------------------------------------------------------------------------------------------
